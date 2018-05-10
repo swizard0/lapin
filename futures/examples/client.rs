@@ -1,33 +1,29 @@
 #[macro_use] extern crate log;
 extern crate lapin_futures as lapin;
 extern crate futures;
-extern crate tokio_core;
+extern crate tokio;
 extern crate env_logger;
 
 use futures::future::Future;
 use futures::Stream;
-use tokio_core::reactor::Core;
-use tokio_core::net::TcpStream;
+use tokio::net::TcpStream;
 use lapin::types::FieldTable;
 use lapin::client::ConnectionOptions;
 use lapin::channel::{BasicConsumeOptions,BasicGetOptions,BasicPublishOptions,BasicProperties,ConfirmSelectOptions,ExchangeBindOptions,ExchangeUnbindOptions,ExchangeDeclareOptions,ExchangeDeleteOptions,QueueBindOptions,QueueDeclareOptions};
 
 fn main() {
-  env_logger::init().unwrap();
-  let mut core = Core::new().unwrap();
+  env_logger::init();
 
-  let handle = core.handle();
   let addr = "127.0.0.1:5672".parse().unwrap();
 
-  core.run(
-    TcpStream::connect(&addr, &handle).and_then(|stream| {
+  tokio::run(
+    TcpStream::connect(&addr).and_then(|stream| {
       lapin::client::Client::connect(stream, &ConnectionOptions {
         frame_max: 65535,
         ..Default::default()
       })
-    }).and_then(|(client, heartbeat_future_fn)| {
-      let heartbeat_client = client.clone();
-      handle.spawn(heartbeat_future_fn(&heartbeat_client).map_err(|_| ()));
+    }).and_then(|(client, heartbeat)| {
+      tokio::spawn(heartbeat.map_err(|e| println!("{:?}", e)));
 
       client.create_confirm_channel(ConfirmSelectOptions::default()).and_then(|channel| {
         let id = channel.id;
@@ -71,8 +67,8 @@ fn main() {
           let ch = channel.clone();
           channel.basic_get("hello", &BasicGetOptions::default()).and_then(move |message| {
             info!("got message: {:?}", message);
-            info!("decoded message: {:?}", std::str::from_utf8(&message.data).unwrap());
-            channel.basic_ack(message.delivery_tag)
+            info!("decoded message: {:?}", std::str::from_utf8(&message.delivery.data).unwrap());
+            channel.basic_ack(message.delivery.delivery_tag)
           }).and_then(move |_| {
             ch.basic_consume("hello", "my_consumer", &BasicConsumeOptions::default(), &FieldTable::new())
           })
@@ -86,6 +82,6 @@ fn main() {
           })
         })
       })
-    })
-  ).unwrap();
+    }).map_err(|_| ())
+  )
 }
