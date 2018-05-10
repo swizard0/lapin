@@ -2,8 +2,8 @@ use lapin_async;
 use lapin_async::format::frame::Frame;
 use std::default::Default;
 use std::io;
-use futures::{future,Future,Poll,Stream};
-use futures::sync::oneshot;
+use futures::{future,Future,Poll,Stream,task};
+use futures::channel::oneshot;
 use tokio_io::{AsyncRead,AsyncWrite};
 use tokio_timer::Interval;
 use std::sync::{Arc,Mutex};
@@ -86,10 +86,10 @@ impl Heartbeat {
             });
             heartbeat.select2(rx).then(|res| {
                 match res {
-                    Ok(Either::A((interval, rx))) => Ok(Loop::Continue((interval.into_future(), rx))),
-                    Ok(Either::B((_rx, _interval))) => Ok(Loop::Break(())),
-                    Err(Either::A((err, _rx))) => Err(io::Error::new(io::ErrorKind::Other, err)),
-                    Err(Either::B((err, _interval))) => Err(io::Error::new(io::ErrorKind::Other, err)),
+                    Ok(Either::Left((interval, rx))) => Ok(Loop::Continue((interval.into_future(), rx))),
+                    Ok(Either::Right((_rx, _interval))) => Ok(Loop::Break(())),
+                    Err(Either::Left((err, _rx))) => Err(io::Error::new(io::ErrorKind::Other, err)),
+                    Err(Either::Right((err, _interval))) => Err(io::Error::new(io::ErrorKind::Other, err)),
                 }
             })
         });
@@ -112,8 +112,8 @@ impl Future for Heartbeat {
     type Item = ();
     type Error = io::Error;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.pulse.poll()
+    fn poll(&mut self, cx: &mut task::Context) -> Poll<Self::Item, Self::Error> {
+        self.pulse.poll(cx)
     }
 }
 

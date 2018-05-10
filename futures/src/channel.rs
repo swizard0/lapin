@@ -1,5 +1,5 @@
 use std::io::{self,Error,ErrorKind};
-use futures::{Async,Future,future,Poll,task};
+use futures::{Async,Future,future,Poll};
 use tokio_io::{AsyncRead,AsyncWrite};
 use std::sync::{Arc,Mutex};
 use lapin_async;
@@ -147,13 +147,13 @@ impl<T: AsyncRead+AsyncWrite+Send+'static> Channel<T> {
     /// create a channel
     pub fn create(transport: Arc<Mutex<AMQPTransport<T>>>) -> Box<Future<Item = Self, Error = io::Error> + Send> {
         let channel_transport = transport.clone();
-        let create_channel = future::poll_fn(move || {
+        let create_channel = future::poll_fn(move |cx| {
             let mut transport = match channel_transport.try_lock() {
                 Ok(t) => t,
                 Err(_) => if channel_transport.is_poisoned() {
                     return Err(io::Error::new(io::ErrorKind::Other, "Transport mutex is poisoned"));
                 } else {
-                    task::current().notify();
+                    cx.waker().wake();
                     return Ok(Async::NotReady);
                 }
             };
@@ -348,13 +348,13 @@ impl<T: AsyncRead+AsyncWrite+Send+'static> Channel<T> {
         let channel_id = self.id;
         let _queue = queue.to_string();
         let receive_transport = self.transport.clone();
-        let receive_future = future::poll_fn(move || {
+        let receive_future = future::poll_fn(move |cx| {
             let mut transport = match receive_transport.try_lock() {
                 Ok(t) => t,
                 Err(_) => if receive_transport.is_poisoned() {
                     return Err(io::Error::new(io::ErrorKind::Other, "Transport mutex is poisoned"));
                 } else {
-                    task::current().notify();
+                    cx.waker().wake();
                     return Ok(Async::NotReady);
                 }
             };
@@ -363,7 +363,7 @@ impl<T: AsyncRead+AsyncWrite+Send+'static> Channel<T> {
                 Ok(Async::Ready(message))
             } else {
                 trace!("basic get[{}-{}] not ready", channel_id, _queue);
-                task::current().notify();
+                cx.waker().wake();
                 Ok(Async::NotReady)
             }
         });
@@ -482,13 +482,13 @@ impl<T: AsyncRead+AsyncWrite+Send+'static> Channel<T> {
     pub fn wait_for_answer<Finished>(transport: Arc<Mutex<AMQPTransport<T>>>, request_id: RequestId, finished: Finished) -> Box<Future<Item = Option<bool>, Error = io::Error> + Send>
         where Finished: 'static + Send + Fn(&mut Connection, RequestId) -> Poll<Option<bool>, io::Error> {
         trace!("wait for answer for request {}", request_id);
-        Box::new(future::poll_fn(move || {
+        Box::new(future::poll_fn(move |cx| {
             let mut tr = match transport.try_lock() {
                 Ok(t) => t,
                 Err(_) => if transport.is_poisoned() {
                     return Err(io::Error::new(io::ErrorKind::Other, "Transport mutex is poisoned"));
                 } else {
-                    task::current().notify();
+                    cx.waker().wake();
                     return Ok(Async::NotReady);
                 }
             };

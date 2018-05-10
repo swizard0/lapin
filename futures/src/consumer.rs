@@ -18,14 +18,14 @@ impl<T: AsyncRead+AsyncWrite+Sync+Send+'static> Stream for Consumer<T> {
   type Item = Delivery;
   type Error = io::Error;
 
-  fn poll(&mut self) -> Poll<Option<Delivery>, io::Error> {
+  fn poll_next(&mut self, cx: &mut task::Context) -> Poll<Option<Self::Item>, Self::Error> {
     trace!("consumer[{}] poll", self.consumer_tag);
     let mut transport = match self.transport.try_lock() {
       Ok(t) => t,
       Err(_) => if self.transport.is_poisoned() {
         return Err(io::Error::new(io::ErrorKind::Other, "Transport mutex is poisoned"));
       } else {
-        task::current().notify();
+        cx.waker().wake();
         return Ok(Async::NotReady);
       }
     };
@@ -40,4 +40,3 @@ impl<T: AsyncRead+AsyncWrite+Sync+Send+'static> Stream for Consumer<T> {
     }
   }
 }
-

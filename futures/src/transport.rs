@@ -8,7 +8,7 @@ use bytes::BytesMut;
 use std::cmp;
 use std::iter::repeat;
 use std::io::{self,Error,ErrorKind};
-use futures::{Async,Poll,Sink,Stream,StartSend,Future,future,task};
+use futures::{Async,Poll,Sink,Stream,Future,future,task};
 use tokio_io::{AsyncRead,AsyncWrite};
 use tokio_io::codec::{Decoder,Encoder,Framed};
 use channel::BasicProperties;
@@ -212,7 +212,7 @@ impl<T> Future for AMQPTransportConnector<T>
   type Item  = AMQPTransport<T>;
   type Error = io::Error;
 
-  fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+  fn poll(&mut self, cx: &mut task::Context) -> Poll<Self::Item, Self::Error> {
     debug!("AMQPTransportConnector poll transport is none? {}", self.transport.is_none());
     let mut transport = self.transport.take().unwrap();
 
@@ -236,14 +236,14 @@ impl<T> Future for AMQPTransportConnector<T>
           let poll_ret = transport.poll();
           self.transport = Some(transport);
           poll_ret?;
-          task::current().notify();
+          cx.waker().wake();
           Ok(Async::NotReady)
         }
       },
       _ => {
         // Upstream had no frames
         self.transport = Some(transport);
-        task::current().notify();
+        cx.waker().wake();
         Ok(Async::NotReady)
       },
     }
@@ -257,7 +257,7 @@ impl<T> Stream for AMQPTransport<T>
     type Item = ();
     type Error = io::Error;
 
-    fn poll(&mut self) -> Poll<Option<()>, io::Error> {
+    fn poll_next(&mut self, cx: &mut task::Context) -> Poll<Option<Self::Item>, Self::Error> {
         trace!("stream poll");
         let value = match self.upstream.poll() {
             Ok(Async::Ready(t)) => t,
@@ -292,13 +292,23 @@ impl<T> Sink for AMQPTransport<T>
     type SinkItem = Frame;
     type SinkError = io::Error;
 
-    fn start_send(&mut self, item: Frame) -> StartSend<Frame, io::Error> {
+    fn start_send(&mut self, item: Frame) -> Result<(), Self::SinkError> {
         trace!("sink start send");
         self.upstream.start_send(item)
     }
 
-    fn poll_complete(&mut self) -> Poll<(), io::Error> {
-        trace!("sink poll_complete");
-        self.upstream.poll_complete()
+    fn poll_ready(&mut self, cx: &mut task::Context) -> Poll<(), Self::SinkError> {
+        trace!("sink poll ready");
+        self.upstream.poll_ready(cx);
+    }
+
+    fn poll_flush(&mut self, cx: &mut task::Context) -> Poll<(), Self::SinkError> {
+        trace!("sink poll flush");
+        self.upstream.poll_flush(cx);
+    }
+
+    fn poll_close(&mut self, cx: &mut task::Context) -> Poll<(), Self::SinkError> {
+        trace!("sink poll close");
+        self.upstream.poll_close(cx);
     }
 }
