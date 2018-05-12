@@ -2,7 +2,7 @@ use lapin_async;
 use lapin_async::format::frame::Frame;
 use std::default::Default;
 use std::io;
-use futures::{future,task,Async,Future,Poll,Stream};
+use futures::{future::{self, Either},Future,Poll,Stream,Async,task};
 use futures::sync::oneshot;
 use tokio_io::{AsyncRead,AsyncWrite};
 use tokio_timer::Interval;
@@ -52,54 +52,16 @@ impl Default for ConnectionOptions {
 pub type ConnectionConfiguration = lapin_async::connection::Configuration;
 
 /// A heartbeat task.
-pub struct Heartbeat {
+pub struct Heartbeat<PF> {
     handle: Option<HeartbeatHandle>,
-    pulse: Box<Future<Item = (), Error = io::Error> + Send>,
+    pulse: PF,
 }
 
-impl Heartbeat {
-    fn new<T>(transport: Arc<Mutex<AMQPTransport<T>>>, heartbeat: u16) -> Self
-    where
-      T: AsyncRead + AsyncWrite + Send + 'static
-    {
-        use self::future::{loop_fn, Either, Loop};
-        let (tx, rx) = oneshot::channel();
-        let interval = Interval::new(Instant::now(), Duration::from_secs(heartbeat.into()))
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
-            .into_future();
-        let neverending = loop_fn((interval, rx), move |(f, rx)| {
-            let transport_send = Arc::clone(&transport);
-            let transport = Arc::clone(&transport);
-            let heartbeat = f.and_then(move |(_instant, interval)| {
-                debug!("poll heartbeat");
-                future::poll_fn(move || {
-                    let mut transport = try_lock_transport!(transport_send);
-                    debug!("Sending heartbeat");
-                    transport.send_frame(Frame::Heartbeat(0));
-                    Ok(Async::Ready(()))
-                }).and_then(move |_| future::poll_fn(move || {
-                    let mut transport = try_lock_transport!(transport);
-                    transport.poll_send()
-                })).then(move |r| match r {
-                    Ok(_) => Ok(interval),
-                    Err(cause) => Err((cause, interval)),
-                })
-            }).or_else(|(err, _interval)| {
-                error!("Error occured in heartbeat interval: {}", err);
-                Err(err)
-            });
-            heartbeat.select2(rx).then(|res| {
-                match res {
-                    Ok(Either::A((interval, rx))) => Ok(Loop::Continue((interval.into_future(), rx))),
-                    Ok(Either::B((_rx, _interval))) => Ok(Loop::Break(())),
-                    Err(Either::A((err, _rx))) => Err(io::Error::new(io::ErrorKind::Other, err)),
-                    Err(Either::B((err, _interval))) => Err(io::Error::new(io::ErrorKind::Other, err)),
-                }
-            })
-        });
+impl<PF> Heartbeat<PF> {
+    fn new(tx: oneshot::Sender<()>, neverending: PF) -> Heartbeat<PF> {
         Heartbeat {
             handle: Some(HeartbeatHandle(tx)),
-            pulse: Box::new(neverending),
+            pulse: neverending,
         }
     }
 
@@ -112,7 +74,7 @@ impl Heartbeat {
     }
 }
 
-impl Future for Heartbeat {
+impl<PF> Future for Heartbeat<PF> where PF: Future<Item = (), Error = io::Error> {
     type Item = ();
     type Error = io::Error;
 
@@ -143,17 +105,55 @@ impl<T: AsyncRead+AsyncWrite+Send+'static> Client<T> {
   /// dispatching events on time.
   /// If we ran it as part of the "main" chain of futures, we might end up not sending
   /// some heartbeats if we don't poll often enough (because of some blocking task or such).
-  pub fn connect(stream: T, options: &ConnectionOptions) -> Box<Future<Item = (Self, Heartbeat), Error = io::Error> + Send> {
-    Box::new(AMQPTransport::connect(stream, options).and_then(|transport| {
+  pub fn connect(stream: T, options: &ConnectionOptions) -> impl Future<Item = (Self, impl Future<Item = (), Error = io::Error>), Error = io::Error> + Send
+  {
+    AMQPTransport::connect(stream, options).and_then(|transport| {
       debug!("got client service");
-      Box::new(future::ok(Self::connect_internal(transport)))
-    }))
+      future::ok(Self::connect_internal(transport))
+    })
   }
 
-  fn connect_internal(transport: AMQPTransport<T>) -> (Self, Heartbeat) {
+  fn connect_internal(transport: AMQPTransport<T>) -> (Self, impl Future<Item = (), Error = io::Error>) {
       let configuration = transport.conn.configuration.clone();
       let transport = Arc::new(Mutex::new(transport));
-      let heartbeat = Heartbeat::new(transport.clone(), configuration.heartbeat);
+
+      use self::future::{loop_fn, Loop};
+      let (tx, rx) = oneshot::channel();
+      let interval = Interval::new(Instant::now(), Duration::from_secs(configuration.heartbeat.into()))
+          .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+          .into_future();
+      let local_transport = transport.clone();
+      let neverending = loop_fn((interval, rx), move |(f, rx)| {
+          let transport_send = Arc::clone(&local_transport);
+          let transport = Arc::clone(&local_transport);
+          let heartbeat = f.and_then(move |(_instant, interval)| {
+              debug!("poll heartbeat");
+              future::poll_fn(move || {
+                  let mut transport = try_lock_transport!(transport_send);
+                  debug!("Sending heartbeat");
+                  transport.send_frame(Frame::Heartbeat(0));
+                  Ok(Async::Ready(()))
+              }).and_then(move |_| future::poll_fn(move || {
+                  let mut transport = try_lock_transport!(transport);
+                  transport.poll_send()
+              })).then(move |r| match r {
+                  Ok(_) => Ok(interval),
+                  Err(cause) => Err((cause, interval)),
+              })
+          }).or_else(|(err, _interval)| {
+              error!("Error occured in heartbeat interval: {}", err);
+              Err(err)
+          });
+          heartbeat.select2(rx).then(|res| {
+              match res {
+                  Ok(Either::A((interval, rx))) => Ok(Loop::Continue((interval.into_future(), rx))),
+                  Ok(Either::B((_rx, _interval))) => Ok(Loop::Break(())),
+                  Err(Either::A((err, _rx))) => Err(io::Error::new(io::ErrorKind::Other, err)),
+                  Err(Either::B((err, _interval))) => Err(io::Error::new(io::ErrorKind::Other, err)),
+              }
+          })
+      });
+      let heartbeat = Heartbeat::new(tx, neverending);
       let client = Client { configuration, transport };
       (client, heartbeat)
   }
@@ -161,21 +161,21 @@ impl<T: AsyncRead+AsyncWrite+Send+'static> Client<T> {
   /// creates a new channel
   ///
   /// returns a future that resolves to a `Channel` once the method succeeds
-  pub fn create_channel(&self) -> Box<Future<Item = Channel<T>, Error = io::Error> + Send> {
+  pub fn create_channel(&self) -> impl Future<Item = Channel<T>, Error = io::Error> + Send {
     Channel::create(self.transport.clone())
   }
 
   /// returns a future that resolves to a `Channel` once the method succeeds
   /// the channel will support RabbitMQ's confirm extension
-  pub fn create_confirm_channel(&self, options: ConfirmSelectOptions) -> Box<Future<Item = Channel<T>, Error = io::Error> + Send> {
+  pub fn create_confirm_channel(&self, options: ConfirmSelectOptions) -> impl Future<Item = Channel<T>, Error = io::Error> + Send {
 
     //FIXME: maybe the confirm channel should be a separate type
     //especially, if we implement transactions, the methods should be available on the original channel
     //but not on the confirm channel. And the basic publish method should have different results
-    Box::new(self.create_channel().and_then(move |channel| {
+    self.create_channel().and_then(move |channel| {
       let ch = channel.clone();
 
       channel.confirm_select(&options).map(|_| ch)
-    }))
+    })
   }
 }

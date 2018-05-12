@@ -8,7 +8,7 @@ use bytes::BytesMut;
 use std::cmp;
 use std::iter::repeat;
 use std::io::{self,Error,ErrorKind};
-use futures::{Async,AsyncSink,Poll,Sink,Stream,Future,future};
+use futures::{Async,Poll,Sink,Stream,Future,future::{self, Either},AsyncSink};
 use tokio_io::{AsyncRead,AsyncWrite};
 use tokio_io::codec::{Decoder,Encoder,Framed};
 use channel::BasicProperties;
@@ -116,7 +116,7 @@ impl<T> AMQPTransport<T>
   /// starts the connection process
   ///
   /// returns a future of a `AMQPTransport` that is connected
-  pub fn connect(stream: T, options: &ConnectionOptions) -> Box<Future<Item = AMQPTransport<T>, Error = io::Error> + Send> {
+  pub fn connect(stream: T, options: &ConnectionOptions) -> impl Future<Item = AMQPTransport<T>, Error = io::Error> + Send {
     let mut conn = Connection::new();
     conn.set_credentials(&options.username, &options.password);
     conn.set_vhost(&options.vhost);
@@ -124,7 +124,7 @@ impl<T> AMQPTransport<T>
     conn.set_heartbeat(options.heartbeat);
     if let Err(e) = conn.connect() {
       let err = format!("Failed to connect: {:?}", e);
-      return Box::new(future::err(Error::new(ErrorKind::ConnectionAborted, err)));
+      return Either::A(future::err(Error::new(ErrorKind::ConnectionAborted, err)));
     }
 
     let codec = AMQPCodec {
@@ -135,10 +135,11 @@ impl<T> AMQPTransport<T>
       flush_needed: false,
       conn:         conn,
     };
+
     let connector = AMQPTransportConnector {
       transport: Some(t),
     };
-    Box::new(connector)
+    Either::B(connector)
   }
 
   /// Send a frame to the broker.
