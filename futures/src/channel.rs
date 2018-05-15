@@ -148,15 +148,7 @@ impl<T: AsyncRead+AsyncWrite+Send+'static> Channel<T> {
     pub fn create(transport: Arc<Mutex<AMQPTransport<T>>>) -> impl Future<Item = Self, Error = io::Error> + Send {
         let channel_transport = transport.clone();
         let create_channel = future::poll_fn(move || {
-            let mut transport = match channel_transport.try_lock() {
-                Ok(t) => t,
-                Err(_) => if channel_transport.is_poisoned() {
-                    return Err(io::Error::new(io::ErrorKind::Other, "Transport mutex is poisoned"));
-                } else {
-                    task::current().notify();
-                    return Ok(Async::NotReady);
-                }
-            };
+            let mut transport = try_lock_transport!(channel_transport);
             return Ok(Async::Ready(Channel {
                 id:        transport.conn.create_channel(),
                 transport: channel_transport.clone(),
