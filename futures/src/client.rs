@@ -83,6 +83,52 @@ impl<PF> Future for Heartbeat<PF> where PF: Future<Item = (), Error = io::Error>
     }
 }
 
+fn build_neverending<T>(
+    heartbeat_interval: Duration,
+    transport: Arc<Mutex<AMQPTransport<T>>>,
+    rx: oneshot::Receiver<()>,
+)
+    -> impl Future<Item = (), Error = io::Error>
+    where T: AsyncRead + AsyncWrite + Send + 'static
+{
+    use self::future::{loop_fn, Loop};
+
+    let interval = Interval::new(Instant::now(), heartbeat_interval)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+        .into_future();
+    loop_fn((interval, rx), move |(f, rx)| {
+        let transport_send = Arc::clone(&transport);
+        let transport = Arc::clone(&transport);
+        let heartbeat = f.and_then(move |(_instant, interval)| {
+            debug!("poll heartbeat");
+            future::poll_fn(move || {
+                let mut transport = try_lock_transport!(transport_send);
+                debug!("Sending heartbeat");
+                transport.send_frame(Frame::Heartbeat(0));
+                Ok(Async::Ready(()))
+            }).and_then(move |_| future::poll_fn(move || {
+                let mut transport = try_lock_transport!(transport);
+                transport.poll_send()
+            })).then(move |r| match r {
+                Ok(_) => Ok(interval),
+                Err(cause) => Err((cause, interval)),
+            })
+        }).or_else(|(err, _interval)| {
+            error!("Error occured in heartbeat interval: {}", err);
+            Err(err)
+        });
+        heartbeat.select2(rx).then(|res| {
+            match res {
+                Ok(Either::A((interval, rx))) => Ok(Loop::Continue((interval.into_future(), rx))),
+                Ok(Either::B((_rx, _interval))) => Ok(Loop::Break(())),
+                Err(Either::A((err, _rx))) => Err(io::Error::new(io::ErrorKind::Other, err)),
+                Err(Either::B((err, _interval))) => Err(io::Error::new(io::ErrorKind::Other, err)),
+            }
+        })
+    })
+}
+
+
 /// A handle to stop a connection heartbeat.
 pub struct HeartbeatHandle(oneshot::Sender<()>);
 
@@ -117,42 +163,12 @@ impl<T: AsyncRead+AsyncWrite+Send+'static> Client<T> {
       let configuration = transport.conn.configuration.clone();
       let transport = Arc::new(Mutex::new(transport));
 
-      use self::future::{loop_fn, Loop};
       let (tx, rx) = oneshot::channel();
-      let interval = Interval::new(Instant::now(), Duration::from_secs(configuration.heartbeat.into()))
-          .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
-          .into_future();
-      let local_transport = transport.clone();
-      let neverending = loop_fn((interval, rx), move |(f, rx)| {
-          let transport_send = Arc::clone(&local_transport);
-          let transport = Arc::clone(&local_transport);
-          let heartbeat = f.and_then(move |(_instant, interval)| {
-              debug!("poll heartbeat");
-              future::poll_fn(move || {
-                  let mut transport = try_lock_transport!(transport_send);
-                  debug!("Sending heartbeat");
-                  transport.send_frame(Frame::Heartbeat(0));
-                  Ok(Async::Ready(()))
-              }).and_then(move |_| future::poll_fn(move || {
-                  let mut transport = try_lock_transport!(transport);
-                  transport.poll_send()
-              })).then(move |r| match r {
-                  Ok(_) => Ok(interval),
-                  Err(cause) => Err((cause, interval)),
-              })
-          }).or_else(|(err, _interval)| {
-              error!("Error occured in heartbeat interval: {}", err);
-              Err(err)
-          });
-          heartbeat.select2(rx).then(|res| {
-              match res {
-                  Ok(Either::A((interval, rx))) => Ok(Loop::Continue((interval.into_future(), rx))),
-                  Ok(Either::B((_rx, _interval))) => Ok(Loop::Break(())),
-                  Err(Either::A((err, _rx))) => Err(io::Error::new(io::ErrorKind::Other, err)),
-                  Err(Either::B((err, _interval))) => Err(io::Error::new(io::ErrorKind::Other, err)),
-              }
-          })
-      });
+      let neverending = build_neverending(
+          Duration::from_secs(configuration.heartbeat.into()),
+          transport.clone(),
+          rx,
+      );
       let heartbeat = Heartbeat::new(tx, neverending);
       let client = Client { configuration, transport };
       (client, heartbeat)
